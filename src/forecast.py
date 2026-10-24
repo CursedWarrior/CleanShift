@@ -25,9 +25,14 @@ FORECAST / ESTIMATE, not an official projection. Clearly labeled in the UI.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 
 from . import carbon
+
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+SNAPSHOT_FILE = "forecast_snapshot.csv"
 
 # Clean sources the grid takes as given (not dispatched to meet residual demand).
 GIVEN_CLEAN = ["Solar", "Wind", "Nuclear", "Hydro"]
@@ -138,4 +143,30 @@ def build_forecast_timeline(history: pd.DataFrame) -> pd.DataFrame:
     fc = pd.DataFrame(rows).fillna(0.0)
     fc = carbon.with_intensity(fc)
     fc["is_forecast"] = True
+    return fc.sort_values("timestamp").reset_index(drop=True)
+
+
+def default_snapshot_path() -> Path:
+    return DEFAULT_DATA_DIR / SNAPSHOT_FILE
+
+
+def save_forecast_snapshot(history: pd.DataFrame, path: str | Path | None = None) -> Path:
+    """Build the live 48h forecast once and write it to a CSV snapshot.
+
+    After this, the app reads the snapshot statically (no live fetch). Re-run to
+    refresh "today". Returns the path written.
+    """
+    path = Path(path) if path is not None else default_snapshot_path()
+    fc = build_forecast_timeline(history)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fc.to_csv(path, index=False)
+    return path
+
+
+def load_forecast_snapshot(path: str | Path | None = None) -> pd.DataFrame:
+    """Read the forecast snapshot CSV. Returns an empty DataFrame if missing."""
+    path = Path(path) if path is not None else default_snapshot_path()
+    if not path.exists():
+        return pd.DataFrame()
+    fc = pd.read_csv(path, parse_dates=["timestamp"])
     return fc.sort_values("timestamp").reset_index(drop=True)

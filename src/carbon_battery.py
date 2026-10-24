@@ -22,8 +22,13 @@ Strategy
 --------
 A simple, explainable threshold rule: rank the hours by intensity. Charge when
 intensity is in the cleanest band, discharge when it is in the dirtiest band,
-bounded by power, capacity, and efficiency. The bands are chosen by percentile
-so the battery cycles roughly once per day's clean/dirty swing.
+bounded by power, capacity, and efficiency. Candidate clean/dirty hours are
+chosen by percentile, but each discharge is only committed when it is
+carbon-POSITIVE after round-trip losses: stored energy carries a carbon
+"cost basis" and is released only into hours dirty enough that delivering it
+avoids more CO2 than it cost to store. On flat days with too small a clean/dirty
+swing the battery simply stays idle, so the net CO2 avoided is never negative
+(cycling at a loss is never worthwhile).
 """
 
 from __future__ import annotations
@@ -96,43 +101,79 @@ def simulate_carbon(
     """
     intensity = [float(x) for x in intensity]
     f = _charge_factor(efficiency)
+    eff = max(min(efficiency, 1.0), 1e-9)
+    n = len(intensity)
 
-    ordered = sorted(intensity)
-    low_thr = _percentile(ordered, charge_pct)
-    high_thr = _percentile(ordered, discharge_pct)
+    charge = [0.0] * n       # grid MWh drawn to charge each hour
+    discharge = [0.0] * n    # MWh delivered each hour
+    # Per-hour remaining power headroom (an hour can only do one or the other).
+    charge_room = [power_mw] * n
+    discharge_room = [power_mw] * n
 
-    soc = float(initial_soc)
-    charge: list[float] = []
-    discharge: list[float] = []
-    soc_trace: list[float] = []
-    co2_charged = 0.0
-    co2_displaced = 0.0
+    # Rank-based greedy matching: repeatedly take the DIRTIEST hour that can
+    # still discharge and pair it with the CLEANEST earlier hour that can still
+    # charge, as long as the pairing is carbon-POSITIVE after round-trip losses
+    # (dirty_ci * eff >= clean_ci) and capacity is never exceeded in between.
+    # This prioritizes saving stored energy for the dirtiest hours instead of
+    # dumping it into the first above-threshold hour (the old greedy flaw).
+    dirty_order = sorted(range(n), key=lambda i: intensity[i], reverse=True)
 
-    for ci in intensity:
-        hour_charge = 0.0
-        hour_discharge = 0.0
+    def soc_after(ch: list[float], di: list[float]) -> list[float]:
+        s, trace = 0.0, []
+        for i in range(n):
+            s += ch[i] * f - di[i] / f
+            s = min(max(s, 0.0), capacity_mwh)
+            trace.append(s)
+        return trace
 
-        if ci <= low_thr:
-            # Clean hour: charge using available room.
-            room = capacity_mwh - soc
-            max_grid_for_room = room / f if f > 0 else 0.0
-            hour_charge = max(min(power_mw, max_grid_for_room), 0.0)
-            soc += hour_charge * f
-            if soc > capacity_mwh:
-                soc = capacity_mwh
-            co2_charged += hour_charge * ci
-        elif ci >= high_thr:
-            # Dirty hour: discharge stored energy.
-            deliverable = soc * f
-            hour_discharge = max(min(power_mw, deliverable), 0.0)
-            soc -= hour_discharge / f
-            if soc < 0:
-                soc = 0.0
-            co2_displaced += hour_discharge * ci
+    def free_capacity_between(ch, di, a, b) -> float:
+        """Min spare capacity over hours [a, b] (so adding a charge->discharge
+        pair won't overflow the tank at any point in between)."""
+        s, spare = 0.0, capacity_mwh
+        for i in range(n):
+            s += ch[i] * f - di[i] / f
+            s = min(max(s, 0.0), capacity_mwh)
+            if a <= i < b:
+                spare = min(spare, capacity_mwh - s)
+        return max(spare, 0.0)
 
-        charge.append(hour_charge)
-        discharge.append(hour_discharge)
-        soc_trace.append(soc)
+    for d_idx in dirty_order:
+        d_ci = intensity[d_idx]
+        # Cleanest earlier hours first.
+        charge_candidates = sorted(
+            (i for i in range(d_idx) if intensity[i] * 1.0 < d_ci * eff - 1e-9),
+            key=lambda i: intensity[i],
+        )
+        for c_idx in charge_candidates:
+            if discharge_room[d_idx] <= 1e-9:
+                break
+            if charge_room[c_idx] <= 1e-9:
+                continue
+            # Profitability: delivering `out` avoids out*d_ci; the stored energy
+            # it uses cost (out / f) * c_ci / f  ... in grid terms, charging
+            # `g` grid MWh stores g*f, delivering that gives g*f*f = g*eff MWh.
+            # So charging g at c_ci and discharging yields net d_ci*g*eff - c_ci*g.
+            if d_ci * eff <= intensity[c_idx] + 1e-9:
+                continue
+            # How much grid-charge can we add at c_idx and deliver at d_idx?
+            spare = free_capacity_between(charge, discharge, c_idx, d_idx)  # stored MWh room
+            # grid charge limited by: charge power, discharge power/eff, capacity room.
+            max_by_charge = charge_room[c_idx]
+            max_by_discharge = discharge_room[d_idx] / eff
+            max_by_cap = spare / f if f > 0 else 0.0
+            g = min(max_by_charge, max_by_discharge, max_by_cap)
+            if g <= 1e-9:
+                continue
+            charge[c_idx] += g
+            discharge[d_idx] += g * eff
+            charge_room[c_idx] -= g
+            discharge_room[d_idx] -= g * eff
+
+    # Tally carbon: each delivered MWh at hour i avoids intensity[i]; each grid
+    # MWh charged at hour j cost intensity[j].
+    co2_displaced = sum(discharge[i] * intensity[i] for i in range(n))
+    co2_charged = sum(charge[i] * intensity[i] for i in range(n))
+    soc_trace = soc_after(charge, discharge)
 
     return CarbonDispatchResult(
         charge=charge,

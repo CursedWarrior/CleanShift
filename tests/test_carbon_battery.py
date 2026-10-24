@@ -48,6 +48,23 @@ def test_efficiency_reduces_benefit():
     assert lossy.co2_displaced_lbs <= lossless.co2_displaced_lbs + 1e-9
 
 
+def test_net_never_negative_on_flat_day():
+    # A nearly flat carbon profile: cycling would lose to efficiency, so the
+    # battery should stay idle and net avoided must be >= 0 (not negative).
+    intensity = [500 + (i % 2) for i in range(24)]  # tiny 1-unit wiggle
+    res = cb.simulate_carbon(intensity, 100, 400, 0.90)
+    assert res.net_co2_avoided_lbs >= -1e-6
+
+
+def test_net_never_negative_random_profiles():
+    import random
+    random.seed(0)
+    for _ in range(50):
+        intensity = [random.uniform(400, 650) for _ in range(24)]
+        res = cb.simulate_carbon(intensity, 200, 800, 0.90)
+        assert res.net_co2_avoided_lbs >= -1e-6, "net CO2 avoided must never be negative"
+
+
 def test_discharge_never_exceeds_power():
     intensity = [100, 100, 900, 900]
     res = cb.simulate_carbon(intensity, power_mw=5, capacity_mwh=100, efficiency=1.0,
