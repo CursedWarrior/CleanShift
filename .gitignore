@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+# Data files are placed by the user; keep the folder but ignore large data files
+data/*.csv
+data/*.xlsx
+data/*.xls
