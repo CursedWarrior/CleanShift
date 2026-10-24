@@ -106,8 +106,9 @@ def test_aggregate_chart_serializes_all_freqs():
         "kg": [1000.0 + i for i in range(120)],
         "cycled": [True] * 120,
     })
+    scale = app._co2_scale(daily["kg"].sum())
     for freq in app.AGG_FREQS:
-        assert app.aggregate_chart(daily, freq).to_dict() is not None
+        assert app.aggregate_chart(daily, freq, scale).to_dict() is not None
 
 
 def test_battery_dispatch_chart_responds_to_size():

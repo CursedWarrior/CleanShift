@@ -28,6 +28,7 @@ from src import (
     loadshift,
     presets,
     timeline,
+    ui_theme,
 )
 
 # Full-year hourly data exceeds Altair's default 5,000-row cap once melted;
@@ -36,19 +37,20 @@ alt.data_transformers.disable_max_rows()
 MAX_HOURLY_CHART_POINTS = 24 * 10  # ~10 days
 
 ROUND_TRIP_EFFICIENCY = 0.90
+LB_PER_KG = 2.20462  # convert the internal lbs/MWh carbon intensity to metric kg/MWh
 
 # Plain-English tooltips shown as a hoverable "?" next to each control/metric.
 HELP = {
     "carbon_intensity": (
-        "How much CO2 the grid emits per unit of electricity right now "
-        "(pounds of CO2 per megawatt-hour). It drops when clean sources like "
+        "How much CO₂ the grid emits per unit of electricity right now "
+        "(kg of CO₂ per megawatt-hour). It drops when clean sources like "
         "solar and wind are generating, and rises when gas or oil 'peaker' "
         "plants ramp up. Lower is cleaner."
     ),
     "emission_factors": (
-        "We estimate each hour's CO2 from the grid's fuel mix, weighting each "
-        "fuel by a standard emission factor: coal ~2,100, oil ~1,700, natural "
-        "gas ~900 lbs CO2/MWh; nuclear, hydro, solar and wind ~0. It's an "
+        "We estimate each hour's CO₂ from the grid's fuel mix, weighting each "
+        "fuel by a standard emission factor: coal ~950, oil ~770, natural "
+        "gas ~410 kg CO₂/MWh; nuclear, hydro, solar and wind ~0. It's an "
         "average-mix estimate, not a plant-by-plant measurement."
     ),
     "energy_kwh": (
@@ -69,10 +71,10 @@ HELP = {
         "How much energy the battery stores (MWh) — the 'tank' size. More "
         "capacity lets it carry more clean midday energy into the dirty evening."
     ),
-    "co2_avoided_shift": "CO2 you'd avoid by running the load in the cleanest window instead of at your usual time.",
+    "co2_avoided_shift": "CO₂ you'd avoid by running the load in the cleanest window instead of at your usual time.",
     "co2_avoided_batt": (
-        "Net CO2 avoided over the period: dirty generation displaced when the "
-        "battery discharges, minus the CO2 of the (cleaner) energy it charged "
+        "Net CO₂ avoided over the period: dirty generation displaced when the "
+        "battery discharges, minus the CO₂ of the (cleaner) energy it charged "
         "with, after round-trip losses. The battery only cycles when it comes "
         "out ahead — on flat days where losses would outweigh the benefit it "
         "stays idle, so this never goes negative."
@@ -92,7 +94,7 @@ HELP = {
 
 INTRO_MD = """
 **The idea in one line:** electricity is *cleaner at some hours than others*, so
-*when* you use or store energy changes how much CO2 you cause.
+*when* you use or store energy changes how much CO₂ you cause.
 
 Around midday, solar and wind are plentiful and the grid is relatively clean,
 sometimes there's more clean power than the grid can use. In the evening the sun
@@ -111,6 +113,8 @@ you can still act on. Hover any **?** for a plain-English definition.
 
 
 st.set_page_config(page_title="Clean Shift", page_icon="🌱", layout="wide")
+ui_theme.inject_css()
+ui_theme.register_altair_theme()
 
 
 # ---------------------------------------------------------------------------
@@ -139,14 +143,126 @@ def _load_forecast() -> pd.DataFrame:
 
 
 def _init_state():
-    st.session_state.setdefault("batt_power_mw", 50)
-    st.session_state.setdefault("batt_capacity_mwh", 200)
+    # Power / capacity are a (value 1-999, unit) pair each; default ≈ Neighborhood.
+    st.session_state.setdefault("batt_power_val", 5)
+    st.session_state.setdefault("batt_power_unit", "MW")
+    st.session_state.setdefault("batt_cap_val", 20)
+    st.session_state.setdefault("batt_cap_unit", "MW")  # MW here means MWh
+    # Which preset is currently active (None once the user edits a value).
+    st.session_state.setdefault("active_preset", "🏘️ Neighborhood")
 
 
 def _apply_preset(name: str):
     p = presets.get_preset(name)
-    st.session_state["batt_power_mw"] = int(p.power_mw)
-    st.session_state["batt_capacity_mwh"] = int(p.capacity_mwh)
+    pv, pu = p.power_display
+    cv, cu = p.capacity_display
+    st.session_state["batt_power_val"] = round(float(pv), 1)
+    st.session_state["batt_power_unit"] = pu
+    st.session_state["batt_cap_val"] = round(float(cv), 1)
+    st.session_state["batt_cap_unit"] = cu
+    st.session_state["active_preset"] = name
+
+
+def _clear_active_preset():
+    """Called when any size control changes — the manual edit means no preset
+    is 'active' anymore, so its highlight should drop."""
+    st.session_state["active_preset"] = None
+
+
+def _fmt_mw(mw: float, energy: bool = False) -> str:
+    """Format an MW/MWh value with the cleanest unit (kW/MW/GW [+h])."""
+    val, unit = presets.nicest_unit(mw)
+    if energy:
+        unit += "h"
+    txt = f"{val:,.1f}".rstrip("0").rstrip(".")
+    return f"{txt} {unit}"
+
+
+@st.cache_data(show_spinner=False)
+def _aggregate_constraint(power: float, capacity: float, cache_key: str) -> dict:
+    """Diagnose the binding constraint across ALL days (consistent with the
+    aggregate metrics), by summing the net CO₂ at the current size vs. with ~25%
+    more power / more capacity, then comparing the total gains."""
+    hist = _load_carbon_history()
+    probe = 1.25
+    base = more_p = more_c = 0.0
+    for _, grp in hist.groupby(hist["timestamp"].dt.normalize()):
+        if len(grp) < 20:
+            continue
+        ci = grp["carbon_lbs_per_mwh"].tolist()
+        base += cb.simulate_carbon(ci, power, capacity, ROUND_TRIP_EFFICIENCY).net_co2_avoided_lbs
+        more_p += cb.simulate_carbon(ci, power * probe, capacity, ROUND_TRIP_EFFICIENCY).net_co2_avoided_lbs
+        more_c += cb.simulate_carbon(ci, power, capacity * probe, ROUND_TRIP_EFFICIENCY).net_co2_avoided_lbs
+    if base <= 1e-9:
+        return {"label": "none", "power_gain": 0.0, "energy_gain": 0.0}
+    pg = (more_p - base) / base
+    eg = (more_c - base) / base
+    tol = 0.02
+    power_helps, energy_helps = pg > tol, eg > tol
+    if power_helps and energy_helps:
+        label = "both"
+    elif power_helps:
+        label = "power"
+    elif energy_helps:
+        label = "energy"
+    else:
+        label = "none"
+    return {"label": label, "power_gain": pg, "energy_gain": eg}
+
+
+def _render_constraint_hint(df: pd.DataFrame, power: float, capacity: float):
+    """Explain which lever (power or capacity) is limiting the battery, judged
+    across the whole dataset so it matches the aggregate metrics."""
+    diag = _aggregate_constraint(power, capacity, str(df["timestamp"].max()))
+    label = diag["label"]
+    if label == "energy":
+        icon, msg = "🔋", ("**Capacity-limited.** The battery empties before the "
+                           "dirty hours end — adding **capacity (MWh)** would help, "
+                           "but more **power** alone won't change the result.")
+    elif label == "power":
+        icon, msg = "⚡", ("**Power-limited.** The battery can't charge/discharge "
+                          "fast enough — adding **power (MW)** would help, but more "
+                          "**capacity** alone won't change the result.")
+    elif label == "both":
+        icon, msg = "⚖️", ("**Well-balanced.** Power and capacity are both working "
+                           "hard here — increasing either one would avoid more CO₂.")
+    else:
+        icon, msg = "😴", ("**Fully utilized / grid too flat.** On a typical day "
+                          "this battery already captures the available swing; "
+                          "bigger numbers won't add much here.")
+    ui_theme.note(icon, msg)
+
+
+def _fmt_hour12(h: int) -> str:
+    """0..23 -> '12 AM', '1 AM', ... '12 PM', ... '11 PM'."""
+    suffix = "AM" if h < 12 else "PM"
+    hour12 = h % 12
+    if hour12 == 0:
+        hour12 = 12
+    return f"{hour12} {suffix}"
+
+
+def _co2_scale(max_kg: float) -> tuple[str, float, int]:
+    """Choose ONE CO₂ mass unit for a whole view, based on its largest value.
+
+    Returns (unit_label, divisor_from_kg, decimals). Every value in that view is
+    then formatted with the same unit so kg/tonnes are never mixed on screen.
+    """
+    m = abs(max_kg)
+    if m >= 1000:          # tonnes
+        return "t", 1000.0, 1 if m < 10000 else 0
+    if m >= 10:            # kilograms, whole
+        return "kg", 1.0, 0
+    if m >= 1:             # small kilograms, show decimals
+        return "kg", 1.0, 2
+    return "g", 0.001, 0   # grams
+
+
+def _fmt_co2(kg: float, scale: tuple[str, float, int], per_year: bool = False) -> str:
+    """Format a kg value using a fixed view-level unit scale."""
+    unit, divisor, decimals = scale
+    suffix = "/yr" if per_year else ""
+    return f"{kg / divisor:,.{decimals}f} {unit}{suffix}"
 
 
 # ---------------------------------------------------------------------------
@@ -170,17 +286,25 @@ def carbon_chart(window: pd.DataFrame) -> alt.Chart:
     plot_df = pd.DataFrame(
         {
             "timestamp": list(pd.to_datetime(window["timestamp"])),
-            "Carbon intensity": [float(x) for x in window["carbon_lbs_per_mwh"]],
+            "Carbon intensity": [float(x) / LB_PER_KG for x in window["carbon_lbs_per_mwh"]],
         }
     )
     plot_df, aggregated = _maybe_downsample(plot_df, ["Carbon intensity"])
     x_title = "Day (daily average)" if aggregated else "Hour"
     return (
         alt.Chart(plot_df)
-        .mark_area(opacity=0.7, color="#16a34a", line={"color": "#15803d"})
+        .mark_area(
+            interpolate="monotone",
+            line={"color": "#2f6b4f", "strokeWidth": 2},
+            color=alt.Gradient(
+                gradient="linear", x1=1, x2=1, y1=1, y2=0,
+                stops=[alt.GradientStop(color="rgba(47,107,79,0.04)", offset=0),
+                       alt.GradientStop(color="rgba(47,107,79,0.42)", offset=1)],
+            ),
+        )
         .encode(
             x=alt.X("timestamp:T", title=x_title),
-            y=alt.Y("Carbon intensity:Q", title="lbs CO2 / MWh",
+            y=alt.Y("Carbon intensity:Q", title="kg CO₂ / MWh",
                     scale=alt.Scale(zero=False)),
             tooltip=["timestamp:T", "Carbon intensity:Q"],
         )
@@ -194,12 +318,19 @@ def solar_carbon_chart(day: pd.DataFrame) -> alt.Chart:
         {
             "timestamp": list(pd.to_datetime(day["timestamp"])),
             "Solar (MW)": [float(x) for x in day["solar_mw"]],
-            "Carbon (lbs/MWh)": [float(x) for x in day["carbon_lbs_per_mwh"]],
+            "Carbon (kg/MWh)": [float(x) / LB_PER_KG for x in day["carbon_lbs_per_mwh"]],
         }
     )
     solar = (
         alt.Chart(base)
-        .mark_area(opacity=0.35, color="#f59e0b")
+        .mark_area(
+            interpolate="monotone",
+            color=alt.Gradient(
+                gradient="linear", x1=1, x2=1, y1=1, y2=0,
+                stops=[alt.GradientStop(color="rgba(233,185,73,0.05)", offset=0),
+                       alt.GradientStop(color="rgba(233,185,73,0.6)", offset=1)],
+            ),
+        )
         .encode(
             x=alt.X("timestamp:T", title="Hour"),
             y=alt.Y("Solar (MW):Q", title="Solar generation (MW)"),
@@ -207,10 +338,10 @@ def solar_carbon_chart(day: pd.DataFrame) -> alt.Chart:
     )
     carbon_line = (
         alt.Chart(base)
-        .mark_line(color="#15803d", strokeWidth=3)
+        .mark_line(color="#2f6b4f", strokeWidth=3)
         .encode(
             x="timestamp:T",
-            y=alt.Y("Carbon (lbs/MWh):Q", title="Carbon intensity (lbs/MWh)",
+            y=alt.Y("Carbon (kg/MWh):Q", title="Carbon intensity (kg/MWh)",
                     scale=alt.Scale(zero=False)),
         )
     )
@@ -228,7 +359,7 @@ def battery_dispatch_chart(window: pd.DataFrame, res) -> alt.Chart:
     base = pd.DataFrame(
         {
             "timestamp": ts,
-            "Carbon": [float(x) for x in window["carbon_lbs_per_mwh"]],
+            "Carbon": [float(x) / LB_PER_KG for x in window["carbon_lbs_per_mwh"]],
         }
     )
 
@@ -262,7 +393,7 @@ def battery_dispatch_chart(window: pd.DataFrame, res) -> alt.Chart:
 
     color_scale = alt.Scale(
         domain=["Charge (store clean)", "Discharge (displace dirty)"],
-        range=["#16a34a", "#f59e0b"],
+        range=["#2f6b4f", "#d2603a"],
     )
 
     layers = []
@@ -285,14 +416,14 @@ def battery_dispatch_chart(window: pd.DataFrame, res) -> alt.Chart:
 
     carbon_line = (
         alt.Chart(base)
-        .mark_line(color="#15803d", strokeWidth=2.5)
+        .mark_line(color="#2b2a26", strokeWidth=2.5)
         .encode(
             x=alt.X("timestamp:T", title="Hour"),
-            y=alt.Y("Carbon:Q", title="Carbon intensity (lbs/MWh)",
+            y=alt.Y("Carbon:Q", title="Carbon intensity (kg/MWh)",
                     scale=alt.Scale(zero=False)),
             tooltip=[
                 alt.Tooltip("hoursminutes(timestamp):T", title="Hour"),
-                alt.Tooltip("Carbon:Q", title="lbs CO2/MWh", format=".0f"),
+                alt.Tooltip("Carbon:Q", title="kg CO₂/MWh", format=".0f"),
             ],
         )
     )
@@ -305,28 +436,28 @@ def shift_window_chart(day: pd.DataFrame, res: loadshift.ShiftResult) -> alt.Cha
     base = pd.DataFrame(
         {
             "timestamp": list(pd.to_datetime(day["timestamp"])),
-            "Carbon": [float(x) for x in day["carbon_lbs_per_mwh"]],
+            "Carbon": [float(x) / LB_PER_KG for x in day["carbon_lbs_per_mwh"]],
         }
     )
     line = (
         alt.Chart(base)
-        .mark_line(color="#15803d")
+        .mark_line(color="#2b2a26", strokeWidth=2)
         .encode(
             x=alt.X("timestamp:T", title="Hour"),
-            y=alt.Y("Carbon:Q", title="lbs CO2 / MWh", scale=alt.Scale(zero=False)),
+            y=alt.Y("Carbon:Q", title="kg CO₂ / MWh", scale=alt.Scale(zero=False)),
         )
         .properties(height=300)
     )
     best = pd.DataFrame({"start": [res.best_start], "end": [res.best_end_exclusive]})
     best_band = (
         alt.Chart(best)
-        .mark_rect(opacity=0.25, color="#16a34a")
+        .mark_rect(opacity=0.30, color="#2f6b4f")
         .encode(x="start:T", x2="end:T")
     )
     base_pt = pd.DataFrame({"t": [res.baseline_start]})
     base_rule = (
         alt.Chart(base_pt)
-        .mark_rule(color="#dc2626", strokeDash=[5, 4], strokeWidth=2)
+        .mark_rule(color="#d2603a", strokeDash=[5, 4], strokeWidth=2.5)
         .encode(x="t:T")
     )
     return best_band + line + base_rule
@@ -339,7 +470,7 @@ def render_loadshift_tab(history: pd.DataFrame, fc: pd.DataFrame):
     st.subheader("When should I run a flexible load?")
     st.caption(
         "Tell us a load and we find the cleanest window to run it, and how much "
-        "CO2 you'd avoid versus running it at your usual time."
+        "CO₂ you'd avoid versus running it at your usual time."
     )
 
     forecast_available = fc is not None and not fc.empty
@@ -371,9 +502,9 @@ def render_loadshift_tab(history: pd.DataFrame, fc: pd.DataFrame):
             help=HELP["duration"], key="shift_duration_h",
         )
     with c3:
-        baseline = st.slider(
-            "Your usual start hour", min_value=0, max_value=23, value=19,
-            help=HELP["baseline"], key="shift_baseline_hour",
+        baseline = st.select_slider(
+            "Your usual start time", options=list(range(24)), value=19,
+            format_func=_fmt_hour12, help=HELP["baseline"], key="shift_baseline_hour",
         )
 
     if mode in ("Today", "Tomorrow"):
@@ -420,11 +551,14 @@ def render_loadshift_tab(history: pd.DataFrame, fc: pd.DataFrame):
     win_end = res.best_end_exclusive.strftime(time_fmt)
     base_label = res.baseline_start.strftime(time_fmt)
 
+    # One CO₂ unit for this whole view, based on the larger value shown.
+    scale = _co2_scale(max(res.best_kg, res.kg_avoided))
+
     m1, m2, m3 = st.columns(3)
     m1.metric("Cleanest window", f"{win_start}–{win_end}")
-    m2.metric("CO2 if shifted", f"{res.best_kg:.2f} kg")
+    m2.metric("CO₂ if shifted", _fmt_co2(res.best_kg, scale))
     m3.metric(
-        "CO2 avoided", f"{res.kg_avoided:.2f} kg",
+        "CO₂ avoided", _fmt_co2(res.kg_avoided, scale),
         delta=f"-{res.pct_avoided:.0f}%", delta_color="inverse",
         help=HELP["co2_avoided_shift"],
     )
@@ -432,7 +566,7 @@ def render_loadshift_tab(history: pd.DataFrame, fc: pd.DataFrame):
     if res.kg_avoided > 0.01:
         st.success(
             f"**Run it {win_start}–{win_end}** instead of {base_label} to avoid "
-            f"**{res.kg_avoided:.2f} kg CO2** ({res.pct_avoided:.0f}% less) — "
+            f"**{_fmt_co2(res.kg_avoided, scale)} CO₂** ({res.pct_avoided:.0f}% less) — "
             f"same energy, cleaner timing."
         )
     else:
@@ -443,6 +577,15 @@ def render_loadshift_tab(history: pd.DataFrame, fc: pd.DataFrame):
 
     st.markdown("**Green band = cleanest window • red dashed line = your usual start**")
     st.altair_chart(shift_window_chart(day, res), width="stretch")
+    if mode in ("Today", "Tomorrow"):
+        ui_theme.source_caption(
+            "Source: carbon estimated from ISO-NE demand, solar & wind forecasts "
+            "(via gridstatus). Forecast / estimate — not an official projection."
+        )
+    else:
+        ui_theme.source_caption(
+            "Source: carbon estimated from the ISO-NE generation fuel mix (via gridstatus)."
+        )
 
 
 @st.cache_data(show_spinner=False)
@@ -476,12 +619,14 @@ AGG_FREQS = {
 }
 
 
-def aggregate_chart(daily: pd.DataFrame, freq_label: str) -> alt.Chart:
-    """A soft gradient area chart of CO2 avoided, bucketed by granularity.
+def aggregate_chart(daily: pd.DataFrame, freq_label: str,
+                    scale: tuple[str, float, int]) -> alt.Chart:
+    """A soft gradient area chart of CO₂ avoided, bucketed by granularity.
 
-    Reads nicer than raw bars: a smooth muted-green area with a crisp top line
-    and hover points, light grid, and clean axes.
+    Uses the view's shared CO₂ unit (``scale``) so the chart never shows a
+    different unit than the metrics above it.
     """
+    unit, divisor, _ = scale
     rule, fmt = AGG_FREQS[freq_label]
     agg = (
         daily.set_index("date")["kg"]
@@ -490,69 +635,82 @@ def aggregate_chart(daily: pd.DataFrame, freq_label: str) -> alt.Chart:
         .reset_index()
     )
     agg = agg[agg["kg"].notna()]
-    agg["tonnes"] = agg["kg"] / 1000.0
+    agg["val"] = agg["kg"] / divisor
     agg["Bucket"] = agg["date"].dt.strftime(fmt)
 
     tooltip = [
         alt.Tooltip("Bucket:N", title=freq_label.rstrip("ly") + " of"),
-        alt.Tooltip("tonnes:Q", title="tonnes CO₂", format=".2f"),
+        alt.Tooltip("val:Q", title=f"CO₂ ({unit})", format=".2f"),
     ]
-    x = alt.X("date:T", title=None, axis=alt.Axis(grid=False, tickCount=8,
-                                                  labelColor="#6b7280",
-                                                  domainColor="#e5e7eb", ticks=False))
-    y = alt.Y("tonnes:Q", title="CO₂ avoided (tonnes)",
-              axis=alt.Axis(grid=True, gridColor="#eef2f0", gridDash=[2, 3],
-                            labelColor="#6b7280", titleColor="#6b7280",
-                            domain=False, ticks=False))
+    x = alt.X("date:T", title=None, axis=alt.Axis(tickCount=8))
+    y = alt.Y("val:Q", title=f"CO₂ avoided ({unit})", axis=alt.Axis(gridDash=[2, 3]))
 
     base = alt.Chart(agg)
     area = base.mark_area(
         interpolate="monotone",
-        line={"color": "#15803d", "strokeWidth": 2.5},
+        line={"color": "#2f6b4f", "strokeWidth": 2.5},
         color=alt.Gradient(
             gradient="linear", x1=1, x2=1, y1=1, y2=0,
             stops=[
-                alt.GradientStop(color="#ffffff", offset=0),
-                alt.GradientStop(color="#bbf7d0", offset=1),
+                alt.GradientStop(color="rgba(47,107,79,0.04)", offset=0),
+                alt.GradientStop(color="rgba(47,107,79,0.5)", offset=1),
             ],
         ),
     ).encode(x=x, y=y)
 
-    points = base.mark_circle(size=42, color="#15803d", opacity=0).encode(
+    points = base.mark_circle(size=52, color="#23402f", opacity=0).encode(
         x=x, y=y, tooltip=tooltip,
     )
     # Visible points only when there aren't too many buckets.
     if len(agg) <= 60:
-        points = points.mark_circle(size=42, color="#15803d", opacity=0.9)
+        points = points.mark_circle(size=52, color="#23402f", opacity=0.9)
 
-    return (
-        alt.layer(area, points)
-        .properties(height=340)
-        .configure_view(stroke=None)
-    )
+    return alt.layer(area, points).properties(height=340)
 
 
 def render_battery_tab(df: pd.DataFrame):
     st.subheader("Would a battery here cut carbon — and how much?")
     st.caption(
-        "An evaluation tool: pick a battery size and see how much CO2 it would "
+        "An evaluation tool: pick a battery size and see how much CO₂ it would "
         "avoid over a full year by charging on clean hours and discharging on "
         "dirty ones. Useful for deciding whether storage is worth building."
     )
 
     st.write("**Battery presets**")
+    active = st.session_state.get("active_preset")
     pcols = st.columns(len(presets.PRESETS))
     for col, p in zip(pcols, presets.PRESETS):
-        col.button(p.name, width="stretch", on_click=_apply_preset, args=(p.name,))
+        is_active = (p.name == active)
+        col.button(
+            p.name, width="stretch", on_click=_apply_preset, args=(p.name,),
+            help=p.spec,
+            type="primary" if is_active else "secondary",
+        )
 
+    # Two side-by-side controls (like before): each a unit toggle inline with
+    # the label, above a full-width value slider. Editing any of them clears the
+    # active-preset highlight.
     s1, s2 = st.columns(2)
     with s1:
-        st.slider("Power (MW)", 1, 1000, key="batt_power_mw", help=HELP["power"])
+        lab, seg = st.columns([2, 3])
+        lab.markdown("**Power**", help=HELP["power"])
+        seg.segmented_control("Power unit", presets.UNITS, key="batt_power_unit",
+                              label_visibility="collapsed", on_change=_clear_active_preset)
+        st.slider("Power value", 1.0, 999.0, step=0.5, key="batt_power_val",
+                  label_visibility="collapsed", on_change=_clear_active_preset)
     with s2:
-        st.slider("Capacity (MWh)", 1, 5000, key="batt_capacity_mwh", help=HELP["capacity"])
+        lab, seg = st.columns([2, 3])
+        lab.markdown("**Capacity**", help=HELP["capacity"])
+        seg.segmented_control("Capacity unit", presets.UNITS, key="batt_cap_unit",
+                              label_visibility="collapsed",
+                              format_func=lambda u: u + "h", on_change=_clear_active_preset)
+        st.slider("Capacity value", 1.0, 999.0, step=0.5, key="batt_cap_val",
+                  label_visibility="collapsed", on_change=_clear_active_preset)
 
-    power = float(st.session_state["batt_power_mw"])
-    capacity = float(st.session_state["batt_capacity_mwh"])
+    power = presets.to_mw(st.session_state["batt_power_val"], st.session_state["batt_power_unit"])
+    capacity = presets.to_mw(st.session_state["batt_cap_val"], st.session_state["batt_cap_unit"])
+
+    _render_constraint_hint(df, power, capacity)
 
     # --- Day-by-day evaluation across all history -----------------------
     cache_key = str(df["timestamp"].max())
@@ -586,37 +744,46 @@ def render_battery_tab(df: pd.DataFrame):
         return
 
     span_days = max(len(window), 1)
-    total_tonnes = window["kg"].sum() / 1000.0
-    tonnes_per_year = total_tonnes * 365.0 / span_days
+    total_kg = window["kg"].sum()
+    kg_per_year = total_kg * 365.0 / span_days
     pct_cycled = 100.0 * window["cycled"].mean()
-    cars = tonnes_per_year * 1000 / 4600.0  # ~4.6 t CO2 per US car per year
+    cars = kg_per_year / 4600.0  # ~4.6 t CO2 per US car per year
+
+    # One CO₂ unit for this whole view (metrics, sentence, and chart).
+    scale = _co2_scale(max(total_kg, kg_per_year))
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("CO2 avoided (in range)", f"{total_tonnes:,.0f} tonnes", help=HELP["co2_avoided_batt"])
-    m2.metric("Annualized", f"{tonnes_per_year:,.0f} t/yr",
+    m1.metric("CO₂ avoided (in range)", _fmt_co2(total_kg, scale), help=HELP["co2_avoided_batt"])
+    m2.metric("Annualized", _fmt_co2(kg_per_year, scale, per_year=True),
               help="The in-range total scaled to a 365-day year, for comparison.")
-    m3.metric("≈ cars off the road", f"{cars:,.0f}",
-              help="Annualized CO2 avoided expressed as equivalent cars.")
+    cars_txt = f"{cars:,.0f}" if cars >= 1 else f"{cars:.2f}"
+    m3.metric("≈ cars off the road", cars_txt,
+              help="Annualized CO₂ avoided expressed as equivalent cars.")
     m4.metric("Days worth cycling", f"{pct_cycled:.0f}%",
               help="Share of days in range where the clean/dirty swing was big "
                    "enough to cycle. On flatter days the battery stays idle.")
 
+    cars_phrase = f"about **{cars:,.0f} cars**" if cars >= 1 else f"about **{cars:.2f} of a car**"
     st.success(
         f"Over **{span_days}** days ({start:%b %d, %Y} – {end:%b %d, %Y}), a "
-        f"**{power:,.0f} MW / {capacity:,.0f} MWh** battery would avoid "
-        f"**{total_tonnes:,.0f} tonnes of CO2** (≈ {tonnes_per_year:,.0f} t/yr, "
-        f"about **{cars:,.0f} cars**). Worth cycling on **{pct_cycled:.0f}%** of "
+        f"**{_fmt_mw(power)} / {_fmt_mw(capacity, energy=True)}** battery would avoid "
+        f"**{_fmt_co2(total_kg, scale)} of CO₂** (≈ {_fmt_co2(kg_per_year, scale, per_year=True)}, "
+        f"{cars_phrase}). Worth cycling on **{pct_cycled:.0f}%** of "
         f"those days; on flatter days it correctly sits idle rather than cycling "
         f"at a loss."
     )
 
-    # --- Primary evaluation view: CO2 avoided over time -----------------
-    st.markdown(f"##### CO2 avoided — {freq_label.lower()}")
+    # --- Primary evaluation view: CO₂ avoided over time -----------------
+    st.markdown(f"##### CO₂ avoided — {freq_label.lower()}")
     st.caption(
         "How the benefit is spread over the selected range. Taller bars mean "
         "periods with a stronger clean-vs-dirty swing (often sunnier stretches)."
     )
-    st.altair_chart(aggregate_chart(window, freq_label), width="stretch")
+    st.altair_chart(aggregate_chart(window, freq_label, scale), width="stretch")
+    ui_theme.source_caption(
+        "Source: carbon estimated from the ISO-NE generation fuel mix, 2025–latest "
+        "(via gridstatus). Standard emission factors; average-mix estimate."
+    )
 
     # --- Secondary: how it works on one example day (collapsed) ---------
     with st.expander("See how it works on a single day"):
@@ -652,23 +819,19 @@ def _render_battery_day(df: pd.DataFrame, power: float, capacity: float):
     if charge_windows or discharge_windows:
         day_kg = day_res.net_co2_avoided_kg
         sources = _charging_sources(day, day_res)
-        src_phrase = (
-            f" Mostly charged by {_join(sources)}." if sources else ""
-        )
-        st.info(
-            f"**On {day_label}, this battery would:**\n\n"
-            f"- 🔋 **Charge** (store clean energy) during **{_join(charge_windows)}** "
-            f"— the cleanest hours.{src_phrase}\n"
-            f"- ⚡ **Discharge** (push stored energy to the grid) during "
-            f"**{_join(discharge_windows)}** — the dirtiest hours, displacing gas "
-            f"and oil.\n\n"
-            f"Net effect that day: **{day_kg:,.0f} kg of CO2 avoided.**"
+        src_phrase = f" Mostly charged by {_join(sources)}." if sources else ""
+        ui_theme.dispatch_summary_card(
+            day_label=day_label,
+            charge_windows=_join(charge_windows),
+            discharge_windows=_join(discharge_windows),
+            source_phrase=src_phrase,
+            net_str=_fmt_co2(day_kg, _co2_scale(day_kg)),
         )
     else:
         st.info(
             f"**On {day_label}, the battery stays idle.** The grid's carbon "
             "intensity barely changes across the day, so after round-trip "
-            "losses (~10%), cycling would *cost* more CO2 than it saves. A "
+            "losses (~10%), cycling would *cost* more CO₂ than it saves. A "
             "battery only helps when there's a big enough clean-vs-dirty swing — "
             "so it does nothing rather than make things worse. Try a sunnier "
             "day (bigger solar swing) or a larger battery."
@@ -676,6 +839,9 @@ def _render_battery_day(df: pd.DataFrame, power: float, capacity: float):
 
     # --- Chart: show the battery actually working on a chosen day -------
     st.altair_chart(battery_dispatch_chart(day, day_res), width="stretch")
+    ui_theme.source_caption(
+        "Source: carbon estimated from the ISO-NE generation fuel mix (via gridstatus)."
+    )
 
 
 def _contiguous_windows(timestamps: list[pd.Timestamp], flags: list[bool]) -> list[str]:
@@ -786,11 +952,7 @@ def _day_slice(df: pd.DataFrame, day: pd.Timestamp) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 def main():
     _init_state()
-    st.title("🌱 Clean Shift")
-    st.caption(
-        "Cut CO2 by shifting *when* energy is used or stored — using real "
-        "ISO-NE data for the Boston area."
-    )
+    ui_theme.hero()
 
     with st.expander("New here? Start with a 30-second tour", expanded=False):
         st.markdown(INTRO_MD)
@@ -818,18 +980,18 @@ def main():
     # Headline "why this matters": cleanest vs dirtiest hour of day.
     by_hour = carbon_hist.assign(h=carbon_hist["timestamp"].dt.hour).groupby("h")["carbon_lbs_per_mwh"].mean()
     cleanest_h, dirtiest_h = int(by_hour.idxmin()), int(by_hour.idxmax())
-    gap = by_hour.max() - by_hour.min()
-    st.info(
-        f"**The grid's daily rhythm (historical average):** cleanest around "
-        f"**{cleanest_h:02d}:00** ({by_hour.min():.0f} lbs CO2/MWh), dirtiest around "
-        f"**{dirtiest_h:02d}:00** ({by_hour.max():.0f}). That {gap:.0f}-point swing "
-        f"is the opportunity this tool helps you capture."
-    )
+    # Convert the internal lbs/MWh to metric kg/MWh for display.
+    cleanest_v = by_hour.min() / LB_PER_KG
+    dirtiest_v = by_hour.max() / LB_PER_KG
+    gap = dirtiest_v - cleanest_v
+    start_year = int(carbon_hist["timestamp"].min().year)
+    ui_theme.rhythm_banner(cleanest_h, cleanest_v, dirtiest_h, dirtiest_v,
+                           gap, data_start_year=start_year)
 
     tab1, tab2, tab3 = st.tabs([
-        "⚡ Load-shift advisor",
-        "🔋 Carbon battery",
-        "📈 The clean/dirty day",
+        "\u2002⚡ Load-shift advisor\u2002",
+        "\u2002🔋 Carbon battery\u2002",
+        "\u2002📈 Solar vs. carbon\u2002",
     ])
     with tab1:
         render_loadshift_tab(carbon_hist, fc)
@@ -845,7 +1007,7 @@ def main():
 - **Fuel mix (historical):** ISO-NE generation by fuel type, fetched via the
   `gridstatus` library and cached hourly from Jan 2025 to the latest day.
 - **Carbon intensity:** estimated from the fuel mix using standard emission
-  factors (coal ~2,100, oil ~1,700, natural gas ~900 lbs CO2/MWh; nuclear,
+  factors (coal ~950, oil ~770, natural gas ~410 kg CO₂/MWh; nuclear,
   hydro, solar, wind ~0). This is an **average-mix** estimate, not a marginal
   rate (a true hourly marginal signal isn't freely available for ISO-NE).
 - **48-hour forecast:** built from ISO-NE's live demand, solar and wind
@@ -861,10 +1023,10 @@ def main():
   the cleanest charging hours with the dirtiest discharging hours, prioritizing
   the dirtiest hours and only cycling when it's carbon-positive after the
   {ROUND_TRIP_EFFICIENCY*100:.0f}% round-trip loss — so on flat days it sits
-  idle and the net is never negative. "CO2 avoided" is dirty generation
-  displaced minus the CO2 of the energy charged; the per-year figure scales the
+  idle and the net is never negative. "CO₂ avoided" is dirty generation
+  displaced minus the CO₂ of the energy charged; the per-year figure scales the
   observed total to 365 days.
-- **Car-equivalent:** ~4.6 tonnes CO2 per US passenger car per year (rough EPA
+- **Car-equivalent:** ~4.6 tonnes CO₂ per US passenger car per year (rough EPA
   figure), for intuition only.
             """
         )
@@ -881,6 +1043,9 @@ def render_duckcurve_tab(df: pd.DataFrame):
     st.altair_chart(solar_carbon_chart(day), width="stretch")
     st.caption("Orange area = solar generation • green line = grid carbon intensity. "
                "This inverse relationship is the whole premise of Clean Shift.")
+    ui_theme.source_caption(
+        "Source: ISO-NE generation fuel mix (solar MW + fuel-weighted carbon), via gridstatus."
+    )
 
 
 if __name__ == "__main__":

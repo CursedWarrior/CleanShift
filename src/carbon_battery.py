@@ -186,3 +186,52 @@ def simulate_carbon(
         capacity_mwh=capacity_mwh,
         efficiency=efficiency,
     )
+
+
+def binding_constraint(
+    intensity: list[float],
+    power_mw: float,
+    capacity_mwh: float,
+    efficiency: float,
+    probe: float = 1.25,
+    tol: float = 0.02,
+) -> dict:
+    """Diagnose what limits the battery: power, energy (capacity), both, or none.
+
+    We re-run the dispatch with ~25% more power (capacity fixed) and with ~25%
+    more capacity (power fixed), and compare the net CO2 avoided to the baseline.
+    Whichever unlocks a meaningful gain is "binding"; if neither helps, the day
+    is simply too flat.
+
+    Returns a dict: ``label`` in {"power", "energy", "both", "none"},
+    plus ``power_gain`` / ``energy_gain`` (fractional improvements).
+    """
+    base = simulate_carbon(intensity, power_mw, capacity_mwh, efficiency)
+    base_net = base.net_co2_avoided_lbs
+
+    more_power = simulate_carbon(intensity, power_mw * probe, capacity_mwh, efficiency)
+    more_cap = simulate_carbon(intensity, power_mw, capacity_mwh * probe, efficiency)
+
+    def gain(r) -> float:
+        if base_net <= 1e-9:
+            return (r.net_co2_avoided_lbs - base_net)  # absolute if base ~0
+        return (r.net_co2_avoided_lbs - base_net) / base_net
+
+    pg = gain(more_power)
+    eg = gain(more_cap)
+
+    power_helps = pg > tol
+    energy_helps = eg > tol
+
+    if base_net <= 1e-9 and not power_helps and not energy_helps:
+        label = "none"
+    elif power_helps and energy_helps:
+        label = "both"
+    elif power_helps:
+        label = "power"
+    elif energy_helps:
+        label = "energy"
+    else:
+        label = "none"
+
+    return {"label": label, "power_gain": pg, "energy_gain": eg}

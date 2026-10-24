@@ -65,6 +65,19 @@ def test_net_never_negative_random_profiles():
         assert res.net_co2_avoided_lbs >= -1e-6, "net CO2 avoided must never be negative"
 
 
+def test_binding_constraint_energy_vs_power():
+    # Big swing day. A tiny-capacity battery is energy-limited; a tiny-power,
+    # huge-capacity battery is power-limited.
+    intensity = [300] * 6 + [900] * 6 + [300] * 6 + [900] * 6
+    energy_ltd = cb.binding_constraint(intensity, power_mw=100, capacity_mwh=10, efficiency=0.9)
+    assert energy_ltd["label"] in ("energy", "both")
+    assert energy_ltd["energy_gain"] > energy_ltd["power_gain"]
+
+    power_ltd = cb.binding_constraint(intensity, power_mw=2, capacity_mwh=1000, efficiency=0.9)
+    assert power_ltd["label"] in ("power", "both")
+    assert power_ltd["power_gain"] > power_ltd["energy_gain"]
+
+
 def test_discharge_never_exceeds_power():
     intensity = [100, 100, 900, 900]
     res = cb.simulate_carbon(intensity, power_mw=5, capacity_mwh=100, efficiency=1.0,

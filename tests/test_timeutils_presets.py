@@ -54,11 +54,31 @@ def test_presets_span_a_range_of_durations():
     assert len(durations) > 1, "presets should vary in duration, not just scale"
 
 
-def test_presets_within_slider_ranges():
-    # Power slider is 1-1000 MW, capacity 1-5000 MWh.
+def test_presets_display_within_slider_range():
+    # The UI is a value slider (1-999) + unit dropdown (kW/MW/GW). Every preset
+    # must express as a value in [1, 999] with a valid unit, for both power and
+    # capacity, and round-trip back to its MW/MWh value.
     for p in presets.PRESETS:
-        assert 1 <= p.power_mw <= 1000
-        assert 1 <= p.capacity_mwh <= 5000
+        for mw, (val, unit) in [
+            (p.power_mw, p.power_display),
+            (p.capacity_mwh, p.capacity_display),
+        ]:
+            assert unit in presets.UNITS
+            assert 1 <= val < 1000, f"{p.name}: {val} {unit} out of slider range"
+            assert presets.to_mw(val, unit) == pytest.approx(mw)
+
+
+def test_unit_conversion():
+    assert presets.to_mw(11.5, "kW") == pytest.approx(0.0115)
+    assert presets.to_mw(5, "MW") == pytest.approx(5.0)
+    assert presets.to_mw(1, "GW") == pytest.approx(1000.0)
+    # nicest_unit picks a clean 1-999 value + matching unit.
+    v, u = presets.nicest_unit(0.0115)
+    assert u == "kW" and v == pytest.approx(11.5)
+    v, u = presets.nicest_unit(400.0)
+    assert u == "MW" and v == pytest.approx(400.0)
+    v, u = presets.nicest_unit(1500.0)
+    assert u == "GW" and v == pytest.approx(1.5)
 
 
 def test_presets_unknown_raises():
